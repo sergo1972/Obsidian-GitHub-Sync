@@ -1,14 +1,19 @@
 import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, Vault } from 'obsidian';
 import { simpleGit, SimpleGit, CleanOptions, SimpleGitOptions } from 'simple-git';
 import { setIntervalAsync, clearIntervalAsync } from 'set-interval-async';
+// @ts-ignore
+import gitMobile from 'isomorphic-git';
+// @ts-ignore
+import LightningFS from '@isomorphic-git/lightning-fs';
+// @ts-ignore
+import http from 'isomorphic-git/http/web';
 
 let simpleGitOptions: Partial<SimpleGitOptions>;
 let git: SimpleGit;
 
-
 interface GHSyncSettings {
 	remoteURL: string;
-	gitLocation: string;
+	gitLocation: string; // Для мобильных устройств будет GitHub PAT
 	syncinterval: number;
 	isSyncOnLoad: boolean;
 	checkStatusOnLoad: boolean;
@@ -22,14 +27,178 @@ const DEFAULT_SETTINGS: GHSyncSettings = {
 	checkStatusOnLoad: true,
 }
 
-
 export default class GHSyncPlugin extends Plugin {
 
 	settings: GHSyncSettings;
 
-	async SyncNotes()
-	{
-		new Notice("Syncing to GitHub remote")
+	isMobile(): boolean {
+		return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+	}
+
+	async mobileSync() {
+		new Notice("Mobile Sync: syncing with GitHub...");
+
+		const vaultPath = '/vault';
+		const fs = new LightningFS('vault');
+		const dir = vaultPath;
+		const repoUrl = this.settings.remoteURL.trim();
+		const token = this.settings.gitLocation.trim();
+
+		if (!repoUrl || !token) {
+			new Notice("Mobile Sync: Please configure Remote URL and GitHub Token in settings", 10000);
+			return;
+		}
+
+		try {
+			// Check if repository is initialized
+			let isRepo = false;
+			try {
+				await gitMobile.findRoot({ fs, filepath: dir });
+				isRepo = true;
+			} catch (e) {
+				// Repository not found, need to initialize
+			}
+
+			if (!isRepo) {
+				// Initialize repository
+				await gitMobile.init({ fs, dir });
+				
+				// Add remote origin
+				await gitMobile.addRemote({ fs, dir, remote: 'origin', url: repoUrl });
+				
+				// Clone the repository if it exists
+				try {
+					await gitMobile.clone({
+						fs,
+						http,
+						dir,
+						url: repoUrl,
+						singleBranch: true,
+						onAuth: () => ({ username: token, password: '' })
+					});
+					new Notice("Mobile Sync: Repository cloned successfully");
+				} catch (cloneError) {
+					// If clone fails, create initial commit
+					await gitMobile.add({ fs, dir, filepath: '.' });
+					await gitMobile.commit({ 
+						fs, 
+						dir, 
+						message: 'Initial commit from mobile', 
+						author: { name: 'ObsidianUser', email: 'user@example.com' } 
+					});
+					new Notice("Mobile Sync: Initial commit created");
+				}
+			} else {
+				// Pull latest changes
+				try {
+					await gitMobile.pull({
+						fs,
+						http,
+						dir,
+						url: repoUrl,
+						singleBranch: true,
+						author: { name: 'ObsidianUser', email: 'user@example.com' },
+						onAuth: () => ({ username: token, password: '' })
+					});
+					new Notice("Mobile Sync: Pulled latest changes");
+				} catch (pullError) {
+					new Notice("Mobile Sync: Pull failed, continuing with push", 5000);
+				}
+			}
+
+			// Add all files
+			await gitMobile.add({ fs, dir, filepath: '.' });
+
+			// Check if there are changes to commit
+			const status = await gitMobile.status({ fs, dir, filepath: '.' });
+			if (status.length === 0) {
+				new Notice("Mobile Sync: No changes to commit");
+				return;
+			}
+
+			// Commit
+			const date = new Date();
+			const msg = `Mobile sync ${date.toISOString()}`;
+			await gitMobile.commit({ 
+				fs, 
+				dir, 
+				message: msg, 
+				author: { name: 'ObsidianUser', email: 'user@example.com' } 
+			});
+
+			// Push
+			await gitMobile.push({
+				fs,
+				http,
+				dir,
+				url: repoUrl,
+				onAuth: () => ({ username: token, password: '' })
+			});
+
+			new Notice("Mobile Sync complete ✅");
+		} catch (e) {
+			console.error("Mobile Sync Error:", e);
+			new Notice("Mobile Sync failed ❌: " + (e.message || e), 10000);
+		}
+	}
+
+	async mobileCheckStatus() {
+		if (!this.settings.checkStatusOnLoad) return;
+
+		const vaultPath = '/vault';
+		const fs = new LightningFS('vault');
+		const dir = vaultPath;
+		const repoUrl = this.settings.remoteURL.trim();
+		const token = this.settings.gitLocation.trim();
+
+		if (!repoUrl || !token) {
+			return;
+		}
+
+		try {
+			// Check if repository exists
+			await gitMobile.findRoot({ fs, filepath: dir });
+			
+			// Fetch latest changes
+			await gitMobile.fetch({
+				fs,
+				http,
+				dir,
+				url: repoUrl,
+				onAuth: () => ({ username: token, password: '' })
+			});
+
+			// Check status
+			const status = await gitMobile.status({ fs, dir, filepath: '.' });
+			const log = await gitMobile.log({ fs, dir, depth: 1 });
+			const remoteLog = await gitMobile.log({ fs, dir, ref: 'origin/main', depth: 1 });
+
+			if (log.length > 0 && remoteLog.length > 0) {
+				const localCommit = log[0].oid;
+				const remoteCommit = remoteLog[0].oid;
+				
+				if (localCommit !== remoteCommit) {
+					if (this.settings.isSyncOnLoad) {
+						this.mobileSync();
+					} else {
+						new Notice("Mobile Sync: Repository is behind remote. Click sync to update.");
+					}
+				} else {
+					new Notice("Mobile Sync: Repository is up to date.");
+				}
+			}
+		} catch (e) {
+			// Repository not initialized or other error - ignore
+		}
+	}
+
+	async SyncNotes() {
+		if (this.isMobile()) {
+			await this.mobileSync();
+			return;
+		}
+
+		new Notice("Syncing to GitHub remote");
 
 		const remote = this.settings.remoteURL.trim();
 
@@ -47,7 +216,8 @@ export default class GHSyncPlugin extends Plugin {
 
 		let statusResult = await git.status().catch((e) => {
 			new Notice("Vault is not a Git repo or git binary cannot be found.", 10000);
-			return; })
+			return;
+		});
 
 		//@ts-ignore
 		let clean = statusResult.isClean();
@@ -55,8 +225,6 @@ export default class GHSyncPlugin extends Plugin {
     	let date = new Date();
     	let msg = hostname + " " + date.getFullYear() + "-" + (date.getMonth() + 1) + "-" + date.getDate() + ":" + date.getHours() + ":" + date.getMinutes() + ":" + date.getSeconds();
 
-		// git add .
-		// git commit -m hostname-date-time
 		if (!clean) {
 			try {
 				await git
@@ -89,8 +257,6 @@ export default class GHSyncPlugin extends Plugin {
 
 		new Notice("GitHub Sync: Successfully set remote origin url");
 
-
-		// git pull origin main
 	    try {
 	    	//@ts-ignore
 	    	await git.pull('origin', 'main', { '--no-rebase': null }, (err, update) => {
@@ -116,8 +282,6 @@ export default class GHSyncPlugin extends Plugin {
 	    	return;
 	    }
 
-		// resolve merge conflicts
-		// git push origin main
 	    if (!clean) {
 		    try {
 		    	git.push('origin', 'main', ['-u']);
@@ -128,9 +292,12 @@ export default class GHSyncPlugin extends Plugin {
 	    }
 	}
 
-	async CheckStatusOnStart()
-	{
-		// check status
+	async CheckStatusOnStart() {
+		if (this.isMobile()) {
+			await this.mobileCheckStatus();
+			return;
+		}
+
 		try {
 			simpleGitOptions = {
 				//@ts-ignore
@@ -141,13 +308,10 @@ export default class GHSyncPlugin extends Plugin {
 			};
 			git = simpleGit(simpleGitOptions);
 
-			//check for remote changes
-			// git branch --set-upstream-to=origin/main main
 			await git.branch({'--set-upstream-to': 'origin/main'});
 			let statusUponOpening = await git.fetch().status();
 			if (statusUponOpening.behind > 0)
 			{
-				// Automatically sync if needed
 				if (this.settings.isSyncOnLoad == true)
 				{
 					this.SyncNotes();
@@ -162,8 +326,7 @@ export default class GHSyncPlugin extends Plugin {
 				new Notice("GitHub Sync: up to date with remote.")
 			}
 		} catch (e) {
-			// don't care
-			// based
+			// ignore
 		}
 	}
 
@@ -183,7 +346,6 @@ export default class GHSyncPlugin extends Plugin {
 			}
 		});
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new GHSyncSettingTab(this.app, this));
 
 		if (!isNaN(this.settings.syncinterval))
@@ -195,11 +357,8 @@ export default class GHSyncPlugin extends Plugin {
 					setIntervalAsync(async () => {
 						await this.SyncNotes();
 					}, interval * 60 * 1000);
-					//this.registerInterval(setInterval(this.SyncNotes, interval * 6 * 1000));
 					new Notice("Auto sync enabled");
-				} catch (e) {
-					
-				}
+				} catch (e) { }
 			}
 		}
 
@@ -209,9 +368,7 @@ export default class GHSyncPlugin extends Plugin {
 		}
 	}
 
-	onunload() {
-
-	}
+	onunload() { }
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -232,12 +389,11 @@ class GHSyncSettingTab extends PluginSettingTab {
 
 	display(): void {
 		const {containerEl} = this;
-
 		containerEl.empty();
 
 		const howto = containerEl.createEl("div", { cls: "howto" });
 		howto.createEl("div", { text: "How to use this plugin", cls: "howto_title" });
-		howto.createEl("small", { text: "Grab your GitHub repository's HTTPS or SSH url and paste it into the settings here. If you're not authenticated, the first sync with this plugin should prompt you to authenticate. If you've already setup SSH on your device with GitHub, you won't need to authenticate - just paste your repo's SSH url into the settings here.", cls: "howto_text" });
+		howto.createEl("small", { text: "Grab your GitHub repository's HTTPS or SSH url and paste it into the settings here. If you're on mobile, also paste your GitHub Personal Access Token in the token field. For mobile sync, you need a token with 'repo' permissions.", cls: "howto_text" });
 		howto.createEl("br");
         const linkEl = howto.createEl('p');
         linkEl.createEl('span', { text: 'See the ' });
@@ -257,16 +413,15 @@ class GHSyncSettingTab extends PluginSettingTab {
         	.inputEl.addClass('my-plugin-setting-text'));
 
 		new Setting(containerEl)
-			.setName('git binary location')
-			.setDesc('This is optional! Set this only if git is not findable via your system PATH, then provide its location here. See README for more info.')
+			.setName('GitHub Personal Access Token (mobile)')
+			.setDesc('Enter your GitHub Personal Access Token for mobile sync. On desktop this field is ignored. Create a token at: https://github.com/settings/tokens')
 			.addText(text => text
-				.setPlaceholder('')
+				.setPlaceholder('ghp_xxxxxxxxxxxxxxxxxxxx')
 				.setValue(this.plugin.settings.gitLocation)
 				.onChange(async (value) => {
 					this.plugin.settings.gitLocation = value;
 					await this.plugin.saveSettings();
-				})
-        	.inputEl.addClass('my-plugin-setting-text2'));
+				}));
 
 		new Setting(containerEl)
 			.setName('Check status on startup')
@@ -290,7 +445,7 @@ class GHSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Auto sync at interval')
-			.setDesc('Set minute interval after which your vault is synced automatically. Auto sync is disabled if this field is left empty or not a positive integer. Restart Obsidan to take effect.')
+			.setDesc('Set minute interval after which your vault is synced automatically. Auto sync is disabled if this field is left empty or not a positive integer. Restart Obsidian to take effect.')
 			.addText(text => text
 				.setValue(String(this.plugin.settings.syncinterval))
 				.onChange(async (value) => {

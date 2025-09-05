@@ -23,6 +23,8 @@
 	},
 	"dependencies": {
 		"set-interval-async": "^3.0.3",
-		"simple-git": "^3.22.0"
+		"simple-git": "^3.22.0",
+		"isomorphic-git": "^1.33.1",
+		"@isomorphic-git/lightning-fs": "^4.6.2"
 	}
 }
